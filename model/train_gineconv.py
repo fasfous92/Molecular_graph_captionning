@@ -1,4 +1,6 @@
 import os
+import copy
+import gc
 
 import torch
 import torch.nn as nn
@@ -30,11 +32,11 @@ VAL_EMB_CSV   = "data/validation_embeddings.csv"
 
 # Training parameters
 BATCH_SIZE = 32
-EPOCHS = 5
+EPOCHS = 50
 LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-TEST_MODE = True
+TEST_MODE = False
 N_SAMPLES = 10
 
 
@@ -151,6 +153,7 @@ class LimitedGraphDataset:
 def train_epoch(mol_enc, loader, optimizer, device):
     mol_enc.train()
 
+
     total_loss, total = 0.0, 0
     for graphs, text_emb in loader:
         graphs = graphs.to(device)
@@ -159,8 +162,28 @@ def train_epoch(mol_enc, loader, optimizer, device):
         mol_vec = mol_enc(graphs)
         txt_vec = F.normalize(text_emb, dim=-1)
 
-        loss = F.mse_loss(mol_vec, txt_vec)
+        #loss = F.mse_loss(mol_vec, txt_vec)
 
+        # --- CHANGE 2: Calculate Similarity Matrix ---
+        # This creates a square matrix (Batch_Size x Batch_Size)
+        # It compares every graph against every text in the batch.
+        logits = torch.matmul(mol_vec, txt_vec.T) / 0.07
+
+        # --- CHANGE 3: Create Targets ---
+        # The correct match for graph #0 is text #0. 
+        # The correct match for graph #1 is text #1.
+        labels = torch.arange(logits.size(0)).to(device)
+
+        # --- CHANGE 4: Symmetric Cross Entropy Loss ---
+        # Calculate loss looking from Graph -> Text
+        loss_i = F.cross_entropy(logits, labels)
+        # Calculate loss looking from Text -> Graph
+        loss_t = F.cross_entropy(logits.T, labels)
+        
+        # Average them (Standard CLIP approach)
+        loss = (loss_i + loss_t) / 2
+
+        
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -280,6 +303,11 @@ def main():
 
     optimizer = torch.optim.Adam(mol_enc.parameters(), lr=LR)
 
+    #to keep best model before overfitting:
+    best_mrr = 0.0
+    best_model_weights = None
+    best_model_val_score=None
+
     for ep in range(EPOCHS):
         train_loss = train_epoch(mol_enc, train_dl, optimizer, DEVICE)
         if val_emb is not None and os.path.exists(VAL_GRAPHS):
@@ -289,15 +317,38 @@ def main():
                 limited_val_ds = LimitedGraphDataset(full_val_ds, N_SAMPLES//2)  # Use fewer validation samples
                 val_dl = DataLoader(limited_val_ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
                 val_scores = eval_retrieval_test(val_dl, mol_enc, DEVICE)
+                current_mrr = val_scores['MRR']
             else:
                 val_scores = eval_retrieval(VAL_GRAPHS, val_emb, mol_enc, DEVICE)
+                current_mrr=val_scores['MRR']
         else:
             val_scores = {}
+            current_mrr=0
+
+        #print("current",current_mrr)
         print(f"Epoch {ep+1}/{EPOCHS} - loss={train_loss:.4f} - val={val_scores}")
-    
+        # 2. Check if this is the new best score
+        if current_mrr > best_mrr:
+            best_mrr = current_mrr
+            best_model_val_score=val_scores
+            if best_model_weights is not None:
+                del best_model_weights
+                
+                # Force Python to release RAM
+                gc.collect()
+                
+                # Force PyTorch to release GPU memory (if using CUDA)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+            # Now it is safe to make a new copy
+            best_model_weights = copy.deepcopy(mol_enc.state_dict())
+            print(f"New best found! (Old copy deleted, New copy saved to RAM)")
+
     model_path = "model_checkpoint.pt"
     torch.save(mol_enc.state_dict(), model_path)
     print(f"\nModel saved to {model_path}")
+    print(f"the final chose model has the following val score: ",val_scores)
 
 
 if __name__ == "__main__":
